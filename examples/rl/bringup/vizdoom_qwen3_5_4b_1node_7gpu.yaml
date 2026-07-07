@@ -156,6 +156,7 @@ trainer_args:
           dtype: bfloat16
           trust_remote_code: true
           gpu_memory_utilization: 0.85
+          enforce_eager: true # 5 concurrent engine-cores race the shared VIRTIOFS compile cache (job 750867); eager skips torch.compile entirely
           max_model_len: 32768
           max_num_seqs: 8
           system_prompt: "You are a careful VizDoom agent. Choose one valid action for the current frame."
@@ -176,6 +177,7 @@ trainer_args:
           dtype: bfloat16
           trust_remote_code: true
           gpu_memory_utilization: 0.85
+          enforce_eager: true # 5 concurrent engine-cores race the shared VIRTIOFS compile cache (job 750867); eager skips torch.compile entirely
           max_model_len: 32768
           max_num_seqs: 8
           system_prompt: "You are a careful VizDoom agent. Choose one valid action for the current frame."
