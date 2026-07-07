@@ -17,6 +17,23 @@ _AGENTIC_ONLY_KEYS = {"max_agentic_steps", "max_game_steps", "game_seed"}
 _GENERATION_KEYS_TO_DROP = {"do_sample", "num_beams"}
 
 
+def _vllm_worker_has_native_reload() -> bool:
+    """True if the running vLLM's GPU worker already defines ``reload_weights``.
+
+    vLLM >= ~0.12 provides a native ``Worker.reload_weights`` (delegating to
+    ``model_runner.reload_weights(weights_path=..., is_checkpoint_format=...)``),
+    which serves ``collective_rpc("reload_weights", ...)`` directly. When present,
+    injecting :class:`WeightReloadWorkerExtension` (same method name) trips vLLM's
+    attribute-conflict guard. On probe failure, return ``False`` so the extension
+    is injected -- preserving the older-vLLM behavior A1 designed for.
+    """
+    try:
+        from vllm.v1.worker.gpu_worker import Worker
+    except Exception:
+        return False
+    return hasattr(Worker, "reload_weights")
+
+
 class VLLMChatModelServer(ModelServer):
     """In-process vLLM chat backend for Ray actor model serving.
 
@@ -40,15 +57,20 @@ class VLLMChatModelServer(ModelServer):
         except ImportError as exc:
             raise ImportError("VLLMChatModelServer requires `vllm`. Install vLLM in the rollout environment.") from exc
 
-        # Make collective_rpc("reload_weights", ...) resolvable: stock vLLM workers
-        # have no reload_weights method, so mix in a worker extension that reloads
-        # safetensors from the merged HF checkpoint. Dotted qualname because vLLM's
-        # resolve_obj_by_qualname splits on the last dot. setdefault keeps any
-        # caller-supplied worker_extension_cls.
-        engine_kwargs.setdefault(
-            "worker_extension_cls",
-            "lmms_engine.rl.model_server.vllm_worker_ext.WeightReloadWorkerExtension",
-        )
+        # Make collective_rpc("reload_weights", ...) resolvable for disk weight sync.
+        # vLLM >= ~0.12 ships a NATIVE Worker.reload_weights(weights_iterator=None,
+        # weights_path=None, is_checkpoint_format=True) that already streams a merged
+        # HF checkpoint from disk -- exactly what _reload_weights needs -- so no
+        # extension is required. Injecting WeightReloadWorkerExtension (which also
+        # defines reload_weights) on such a build trips vLLM's attribute-conflict
+        # guard in worker_base.init_worker and crashes engine-core init
+        # (AMILABS-594 r2: verified on vllm 0.23.0). Only fall back to the extension
+        # on an older vLLM (e.g. v0.11.0, which A1 targeted) whose worker lacks the
+        # native method. setdefault still honors any caller-supplied value.
+        if "worker_extension_cls" not in engine_kwargs and not _vllm_worker_has_native_reload():
+            engine_kwargs["worker_extension_cls"] = (
+                "lmms_engine.rl.model_server.vllm_worker_ext.WeightReloadWorkerExtension"
+            )
         self.llm = LLM(model=model, **engine_kwargs)
         self.generation_kwargs = dict(generation_kwargs or {})
         self.chat_template_kwargs = dict(chat_template_kwargs or {})
