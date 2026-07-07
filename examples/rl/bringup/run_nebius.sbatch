@@ -41,7 +41,7 @@ SYNC_DIR="${SYNC_DIR:-${RUN_ROOT}/sync}"
 # --- Pin-commit source (fork; reload guard fix included) ---------------------
 PIN_REMOTE_URL="${PIN_REMOTE_URL:-https://github.com/Luodian/lmms-engine.git}"
 PIN_BRANCH="${PIN_BRANCH:-brian/rl-bringup}"
-PIN_COMMIT="${PIN_COMMIT:-e24499da37230d623f3d7bfc2d64f6eb0fa29d5a}"
+PIN_COMMIT="${PIN_COMMIT:-cfcf13c36923d64dff92992ed59a1324b31ba78d}"
 LMMS_EVAL_URL="${LMMS_EVAL_URL:-https://github.com/EvolvingLMMs-Lab/lmms-eval.git}"
 LMMS_EVAL_COMMIT="${LMMS_EVAL_COMMIT:-d45c1947dd0d15ead37627fab68defe94ce908eb}"
 
