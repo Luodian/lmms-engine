@@ -40,6 +40,15 @@ class VLLMChatModelServer(ModelServer):
         except ImportError as exc:
             raise ImportError("VLLMChatModelServer requires `vllm`. Install vLLM in the rollout environment.") from exc
 
+        # Make collective_rpc("reload_weights", ...) resolvable: stock vLLM workers
+        # have no reload_weights method, so mix in a worker extension that reloads
+        # safetensors from the merged HF checkpoint. Dotted qualname because vLLM's
+        # resolve_obj_by_qualname splits on the last dot. setdefault keeps any
+        # caller-supplied worker_extension_cls.
+        engine_kwargs.setdefault(
+            "worker_extension_cls",
+            "lmms_engine.rl.model_server.vllm_worker_ext.WeightReloadWorkerExtension",
+        )
         self.llm = LLM(model=model, **engine_kwargs)
         self.generation_kwargs = dict(generation_kwargs or {})
         self.chat_template_kwargs = dict(chat_template_kwargs or {})
