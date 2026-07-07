@@ -1,0 +1,257 @@
+# Qwen3.5-4B + VizDoom RL -- SINGLE-NODE 7-GPU bring-up (shared-node variant) (Linear AMILABS-594 r2).
+#
+# Derived from examples/rl/vizdoom_qwen3_5_4b.yaml. Goal: make PR #186's RL stack
+# RUN end-to-end on one 8-GPU node long enough to see reward/loss curves and >=2
+# weight-sync cycles. RL-science issues (REINFORCE-not-GRPO loss, etc.) are known
+# and OUT OF SCOPE here.
+#
+# GPU budget (must sum to <= gpus_per_node; all request 1 integer GPU each):
+#   ray_train.num_workers = 2   FSDP2 train workers          -> 2 GPUs
+#   model_servers.policy.num_replicas = 4   vLLM policy       -> 4 GPUs
+#   model_servers.reference.num_replicas = 1 vLLM reference    -> 1 GPU
+#   ------------------------------------------------------------  7 GPUs total
+#   rollout.num_workers (24) are CPU-only Ray actors (no num_gpus) -> 0 GPUs.
+#
+# Why these counts are authoritative here: with nnodes=1, launch/rl.py takes the
+# NON-multinode path (use_multinode_config == False), so RayResourcePlan and the
+# "1 train + N-1 rollout" node-role validation are BYPASSED. Ray inits locally,
+# auto-detects the node's 8 GPUs, and the numbers below are used verbatim. Keep
+# train + policy + reference <= 8 or the vLLM actors will never get GPUs.
+#
+# Site paths come from env (fail loud if unset), exported by run_bringup_1node.sbatch:
+#   MODEL_DIR   Qwen3.5-4B HF checkpoint dir (config.json + *.safetensors + processor)
+#   OUTPUT_DIR  absolute run output dir
+#   SYNC_DIR    absolute shared policy-sync dir (must be absolute; runner rejects relative)
+#   DATA_PATH   absolute path to vizdoom_train.jsonl
+# Requires OmegaConf >= 2.1 for the built-in ${oc.env:...} resolver.
+
+rl_runtime:
+  enabled: true
+  nnodes: 1
+  gpus_per_node: 7
+  master_addr: null
+  ray_port: "6379"
+  node_rank: "0"
+  train_node_rank: "0"
+  head_node_ip: null
+  wait_timeout: 300
+
+trainer_type: fsdp2_grpo_rl_trainer
+
+dataset_config:
+  dataset_type: qwen3_vl_iterable
+  dataset_format: yaml
+  dataset_path: null
+  processor_config:
+    processor_name: ${oc.env:MODEL_DIR}
+    processor_type: qwen3_vl
+    extra_kwargs:
+      video_max_pixels: 360448
+      video_min_pixels: 28800
+      image_max_pixels: 360448
+      image_min_pixels: 28800
+  object_storage: none
+  packing: false
+  video_sampling_strategy: fps
+  video_max_pixels: 360448
+  video_max_frames: 64
+  video_min_pixels: 28800
+  frame_num: 32
+  fps: 1
+  video_backend: qwen_vl_utils
+
+trainer_args:
+  output_dir: ${oc.env:OUTPUT_DIR}
+  do_train: true
+  do_eval: false
+  eval_strategy: "no"
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 1
+  learning_rate: 1.0e-6
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  max_steps: 60 # Bring-up: enough to cross several weight-sync boundaries (every 5).
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.03
+  logging_steps: 1
+  logging_dir: ${oc.env:OUTPUT_DIR}/tensorboard # Keep TB curves with the run, not the default stale path.
+  save_strategy: steps
+  save_steps: 1000000 # Effectively disable HF full checkpoints; policy-sync writes its own.
+  bf16: true
+  tf32: true
+  dataloader_drop_last: true
+  dataloader_num_workers: 0
+  remove_unused_columns: false
+  gradient_checkpointing: true
+  use_liger_kernel: false
+  use_rmpad: false
+  fsdp2: true
+  fsdp_config:
+    transformer_layer_cls_to_wrap:
+      - Qwen3_5DecoderLayer
+    reshard_after_forward: false
+    min_num_params: 0
+  sp_ulysses_degree: 1
+  reduce_dtype: bfloat16
+  output_dtype: bfloat16
+  optim: adamw_torch_fused
+  seed: 42
+  run_name: linear-594-vizdoom-bringup-1node
+  print_batch_input_steps: 5
+  report_to:
+    - tensorboard
+
+  rl_config:
+    save_final_checkpoint: false
+    sync_policy_weights: true
+    sync_initial_policy_weights: true
+    sync_drain_inflight_rollouts: true
+    sync_drain_timeout_s: 1800.0
+    sync_drain_poll_s: 0.1
+    policy_sync_merge_to_hf: true
+    policy_sync_keep_last: 2
+    update_weight_mode: full
+    update_weight_transport: disk
+    update_weight_disk_dir: ${oc.env:SYNC_DIR} # Must be an absolute shared path.
+    rollout_seed: 42
+    rollout_poll_s: 0.1
+    rollout_sleep_s: 0.05
+    train_shard_log_steps: 3
+
+    task:
+      task_name: vizdoom
+      data_path: ${oc.env:DATA_PATH}
+      data_format: jsonl
+      limit: 40
+      repeats: 16 # 40 docs * 16 = 640 rollout specs (>> ~120 trajectories consumed at 60 steps).
+      observation_parser:
+        name: vizdoom
+        human_view: true
+        video: false
+        image_buffers: ["screen"]
+        require_thinking: true
+      model_output_parser: qwen
+      loop_worker:
+        name: simple
+        multiturn: true
+        history_turns: 2
+      max_steps: 64 # In-episode decision cap (tics_per_action=12; 64 decisions ~= 280-315 tics).
+      seed: 42
+      generation_kwargs:
+        max_new_tokens: 64
+        temperature: 1.0
+        top_p: 0.9
+        do_sample: true
+
+    model_servers:
+      policy:
+        name: ray_actor_pool
+        actor_name_prefix: qwen3-5-4b-vizdoom-policy
+        num_replicas: 4
+        actor_options:
+          num_gpus: 1
+        server:
+          factory: lmms_engine.rl.model_server.vllm:VLLMChatModelServer
+          model: ${oc.env:MODEL_DIR}
+          dtype: bfloat16
+          trust_remote_code: true
+          gpu_memory_utilization: 0.85
+          max_model_len: 32768
+          max_num_seqs: 8
+          system_prompt: "You are a careful VizDoom agent. Choose one valid action for the current frame."
+          generation_kwargs:
+            max_new_tokens: 64
+            temperature: 1.0
+            top_p: 0.9
+            do_sample: true
+      reference:
+        name: ray_actor_pool
+        actor_name_prefix: qwen3-5-4b-vizdoom-reference
+        num_replicas: 1
+        actor_options:
+          num_gpus: 1
+        server:
+          factory: lmms_engine.rl.model_server.vllm:VLLMChatModelServer
+          model: ${oc.env:MODEL_DIR}
+          dtype: bfloat16
+          trust_remote_code: true
+          gpu_memory_utilization: 0.85
+          max_model_len: 32768
+          max_num_seqs: 8
+          system_prompt: "You are a careful VizDoom agent. Choose one valid action for the current frame."
+          generation_kwargs:
+            max_new_tokens: 64
+            temperature: 0.0
+            top_p: 1.0
+            do_sample: false
+
+    rollout:
+      backend: ray
+      num_workers: 24 # CPU-only Ray actors; each runs one synchronous VizDoom episode.
+      max_inflight_per_worker: 1
+      batch_size: 1 # 1 episode per actor call -> avoids the batched-episode fallback path.
+      poll_timeout_s: 0.0
+
+    data_buffer:
+      backend: in_memory
+      max_trajectories: 512
+      high_watermark: 384
+      low_watermark: 128
+      train_batch_size_per_gpu: 1 # global_train_batch_size = 1 * ray_train.num_workers(2) = 2.
+      global_train_batch_size: null
+      min_trajectories_per_batch: null
+      preserve_model_version: true
+
+    training:
+      trainer_type: fsdp2_grpo_rl_trainer
+      global_batch_size: null
+      update_weights_every_steps: 5 # >=2 weight-sync cycles: initial (v0) + step 5 + ...
+      batch_builder: fixed_global
+
+    trajectory_annotation:
+      reference_logprobs: true
+      reference_batch_size: 8
+      reference_max_workers: 4
+
+    algorithm:
+      name: grpo
+      group_size: 8
+      beta: 0.04
+      clip_range_low: 0.2
+      clip_range_high: 0.2
+      reward_key: vizdoom_total_reward
+      fallback_to_total_reward: true
+      use_step_rewards: false
+      normalize_advantages: true
+      advantage_clip: null
+      advantage_epsilon: 1.0e-6
+      max_steps_per_trajectory: 8
+      step_sampling_strategy: uniform
+      system_message: "You are a careful VizDoom agent. Choose one valid action for the current frame."
+      processor_kwargs: {}
+
+    ray_init_kwargs:
+      ignore_reinit_error: true
+
+    weight_sync:
+      reset_prefix_cache: true
+      sleep_level: null # Keep null: LLM.sleep has no `mode` param in stock vLLM (dormant path).
+      preflight_weight_path: true
+      require_hf_checkpoint: true
+
+ray_train:
+  num_workers: 2
+  use_gpu: true
+  resources_per_worker:
+    GPU: 1
+  placement_strategy: PACK
+
+model_config:
+  load_from_pretrained_path: ${oc.env:MODEL_DIR}
+  attn_implementation: sdpa
+  torch_dtype: bfloat16
+  model_general_type: image_text_to_text
+  monkey_patch_kwargs:
+    patch_type: []
+
+extra_kwargs: null

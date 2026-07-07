@@ -18,9 +18,9 @@
 #SBATCH --partition=scaling
 #SBATCH --qos=high
 #SBATCH --nodes=1
-#SBATCH --gpus-per-node=8
-#SBATCH --exclusive
-#SBATCH --mem=0
+#SBATCH --gpus-per-node=7
+#SBATCH --mem=700G
+#SBATCH --cpus-per-task=48
 #SBATCH --time=04:00:00
 #SBATCH --requeue
 #SBATCH --signal=B:USR1@120
@@ -50,7 +50,7 @@ WORK_ROOT="${WORK_ROOT:-/home/brian/work}"
 JOB_TAG="linear-594-2nd-bringup-${SLURM_JOB_ID:-manual}"
 ENGINE_DIR="${WORK_ROOT}/${JOB_TAG}/lmms-engine"
 LMMS_EVAL_DIR="${ENGINE_DIR}/src/lmms-eval"
-CONFIG_YAML="${ENGINE_DIR}/examples/rl/bringup/vizdoom_qwen3_5_4b_1node.yaml"
+CONFIG_YAML="${ENGINE_DIR}/examples/rl/bringup/vizdoom_qwen3_5_4b_1node_7gpu.yaml"
 export TMPDIR="${TMPDIR:-${WORK_ROOT}/${JOB_TAG}/tmp}"
 CONTAINER_MOUNTS="${CONTAINER_MOUNTS:-/home:/home}"
 
@@ -116,12 +116,12 @@ exec python -m lmms_engine.launch.rl \
   hydra.output_subdir=null \
   hydra/job_logging=stdout \
   config_yaml="${CONFIG_YAML}" \
-  --nnodes 1 --gpus-per-node 8
+  --nnodes 1 --gpus-per-node "${SLURM_GPUS_ON_NODE:-7}"
 INNER_EOF
 
 srun \
   --unbuffered \
-  --gpus-per-node=8 \
+  --gpus-per-node="${SLURM_GPUS_ON_NODE:-7}" \
   --cpu-bind=none \
   --container-image="${CONTAINER_IMAGE}" \
   --container-mounts="${CONTAINER_MOUNTS}" \
